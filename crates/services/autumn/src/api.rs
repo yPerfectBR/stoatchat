@@ -1,9 +1,13 @@
 use std::{
-    io::{Cursor, Read, Write},
-    time::Duration,
+    collections::HashMap,
+    io::{Cursor, Read, SeekFrom, Write},
+    path::{Path as FsPath, PathBuf},
+    sync::{Arc, Weak},
+    time::{Duration, SystemTime},
 };
 
 use axum::{
+    body::Body,
     extract::{DefaultBodyLimit, Path, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Redirect, Response},
@@ -22,7 +26,11 @@ use revolt_result::{create_error, Error, Result, ToRevoltError};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use tempfile::NamedTempFile;
+use tokio::fs;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 use tokio::time::Instant;
+use tokio_util::io::ReaderStream;
 use tower_http::cors::{AllowHeaders, Any, CorsLayer};
 use url_escape::encode_component;
 use utoipa::ToSchema;
@@ -33,6 +41,12 @@ use crate::{
 
 /// Build the API router
 pub async fn router() -> Router<AppState> {
+    // Plaintext media cache is intentionally
+    // ephemeral and must not survive restart.
+    let _ = fs::remove_dir_all(media_disk_cache_dir()).await;
+
+    let _ = fs::create_dir_all(media_disk_cache_dir()).await;
+
     let config = config().await;
 
     let cors = CorsLayer::new()
@@ -65,6 +79,25 @@ pub async fn router() -> Router<AppState> {
         .layer(cors)
 }
 
+const DEFAULT_MEDIA_DISK_CACHE_DIR: &str = "/tmp/stoat-autumn-media-cache";
+
+fn media_disk_cache_dir() -> PathBuf {
+    std::env::var_os("AUTUMN_MEDIA_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_MEDIA_DISK_CACHE_DIR))
+}
+
+const MEDIA_DISK_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+
+const MEDIA_DISK_CACHE_MAX_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+const MEDIA_RAM_CACHE_LIMIT: usize = 64 * 1024 * 1024;
+
+lazy_static! {
+    static ref MEDIA_CACHE_LOCKS: Mutex<HashMap<String, Weak<Mutex<()>>>> =
+        Mutex::new(HashMap::new());
+}
+
 lazy_static! {
     /// Short-lived file cache to allow us to populate different CDN regions without increasing bandwidth to S3 provider
     /// Uploads will also be stored here to prevent immediately queued downloads from doing the entire round-trip
@@ -79,7 +112,7 @@ lazy_static! {
         // TODO config
         // .max_capacity(1024 * 1024 * 1024) // Cache up to 1GiB in memory
         // .max_capacity(512 * 1024 * 1024) // Cache up to 512MiB in memory
-        .max_capacity(2 * 1024 * 1024 * 1024) // Cache up to 2GiB in memory
+        .max_capacity(256 * 1024 * 1024) // Keep small files in RAM only
         .time_to_live(Duration::from_secs(5 * 60)) // For up to 5 minutes
         .build();
 }
@@ -92,6 +125,175 @@ async fn retrieve_file_by_hash(hash: &FileHash) -> Result<Vec<u8>> {
         let data = fetch_from_s3(&hash.bucket_id, &hash.path, &hash.iv).await;
         S3_CACHE.insert(hash.id.to_owned(), data.clone()).await;
         data
+    }
+}
+
+fn media_cache_path(hash: &FileHash) -> PathBuf {
+    media_disk_cache_dir().join(&hash.id)
+}
+
+async fn ensure_media_cache_dir() -> Result<()> {
+    fs::create_dir_all(media_disk_cache_dir())
+        .await
+        .to_internal_error()
+}
+
+async fn touch_media_cache(path: &FsPath) {
+    let path = path.to_owned();
+
+    let _ = tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new().write(true).open(path)?;
+
+        file.set_modified(SystemTime::now())
+    })
+    .await;
+}
+
+async fn media_cache_lock(hash_id: &str) -> Arc<Mutex<()>> {
+    let mut locks = MEDIA_CACHE_LOCKS.lock().await;
+
+    // Remove locks whose request group no longer exists.
+    locks.retain(|_, weak_lock| weak_lock.strong_count() > 0);
+
+    if let Some(lock) = locks.get(hash_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+
+    let lock = Arc::new(Mutex::new(()));
+
+    locks.insert(hash_id.to_owned(), Arc::downgrade(&lock));
+
+    lock
+}
+
+async fn cached_media_path(hash: &FileHash) -> Result<PathBuf> {
+    ensure_media_cache_dir().await?;
+
+    let final_path = media_cache_path(hash);
+
+    if let Ok(metadata) = fs::metadata(&final_path).await {
+        if metadata.is_file() {
+            touch_media_cache(&final_path).await;
+
+            return Ok(final_path);
+        }
+    }
+
+    let cache_lock = media_cache_lock(&hash.id).await;
+
+    let _guard = cache_lock.lock().await;
+
+    if fs::metadata(&final_path).await.is_ok() {
+        touch_media_cache(&final_path).await;
+
+        return Ok(final_path);
+    }
+
+    let tmp_path = final_path.with_extension("part");
+
+    let _ = fs::remove_file(&tmp_path).await;
+
+    // Legacy encrypted files still require one complete decrypt,
+    // but this data is immediately written to disk and is not
+    // retained inside the long-lived Moka cache.
+    let data = fetch_from_s3(&hash.bucket_id, &hash.path, &hash.iv).await?;
+
+    {
+        let mut file = fs::File::create(&tmp_path).await.to_internal_error()?;
+
+        file.write_all(&data).await.to_internal_error()?;
+
+        file.flush().await.to_internal_error()?;
+    }
+
+    fs::rename(&tmp_path, &final_path)
+        .await
+        .to_internal_error()?;
+
+    touch_media_cache(&final_path).await;
+
+    Ok(final_path)
+}
+
+async fn read_cached_range(path: &FsPath, range: ByteRange) -> Result<Vec<u8>> {
+    let length = range.end - range.start + 1;
+
+    let mut file = fs::File::open(path).await.to_internal_error()?;
+
+    file.seek(SeekFrom::Start(range.start as u64))
+        .await
+        .to_internal_error()?;
+
+    let mut data = vec![0u8; length];
+
+    file.read_exact(&mut data).await.to_internal_error()?;
+
+    Ok(data)
+}
+
+async fn cleanup_media_disk_cache() {
+    let Ok(mut entries) = fs::read_dir(media_disk_cache_dir()).await else {
+        return;
+    };
+
+    let now = SystemTime::now();
+
+    let mut cached_files: Vec<(PathBuf, SystemTime, u64)> = Vec::new();
+
+    let mut total_size = 0u64;
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+
+        let Ok(metadata) = entry.metadata().await else {
+            continue;
+        };
+
+        if !metadata.is_file() {
+            continue;
+        }
+
+        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+
+        let age = now.duration_since(modified).unwrap_or_default();
+
+        let is_partial = path.extension().and_then(|value| value.to_str()) == Some("part");
+
+        if is_partial {
+            if age > MEDIA_DISK_CACHE_TTL {
+                let _ = fs::remove_file(&path).await;
+            }
+
+            continue;
+        }
+
+        if age > MEDIA_DISK_CACHE_TTL {
+            let _ = fs::remove_file(&path).await;
+
+            continue;
+        }
+
+        total_size = total_size.saturating_add(metadata.len());
+
+        cached_files.push((path, modified, metadata.len()));
+    }
+
+    if total_size <= MEDIA_DISK_CACHE_MAX_BYTES {
+        return;
+    }
+
+    // Oldest access first because mtime is
+    // refreshed by touch_media_cache().
+    cached_files.sort_by_key(|(_, modified, _)| *modified);
+
+    for (path, _, size) in cached_files {
+        if total_size <= MEDIA_DISK_CACHE_MAX_BYTES {
+            break;
+        }
+
+        if fs::remove_file(&path).await.is_ok() {
+            total_size = total_size.saturating_sub(size);
+        }
     }
 }
 
@@ -524,14 +726,54 @@ fn range_not_satisfiable(total_size: usize) -> Response {
     response
 }
 
-fn build_file_response(
+async fn build_streaming_file_response(
+    path: &FsPath,
+    content_type: &str,
+    total_size: usize,
+) -> Result<Response> {
+    let file = fs::File::open(path).await.to_internal_error()?;
+
+    let stream = ReaderStream::with_capacity(file, 256 * 1024);
+
+    let mut response = Response::new(Body::from_stream(stream));
+
+    *response.status_mut() = StatusCode::OK;
+
+    let response_headers = response.headers_mut();
+
+    response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(content_type)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
+
+    response_headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("inline"),
+    );
+
+    response_headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(CACHE_CONTROL),
+    );
+
+    response_headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&total_size.to_string()).unwrap(),
+    );
+
+    Ok(response)
+}
+
+fn build_metadata_response(
     headers: &HeaderMap,
     content_type: &str,
-    data: Vec<u8>,
+    total_size: usize,
     head_only: bool,
+    body: Option<Vec<u8>>,
 ) -> Response {
-    let total_size = data.len();
-
     let range = match parse_range_header(headers, total_size) {
         Ok(range) => range,
         Err(()) => {
@@ -539,84 +781,57 @@ fn build_file_response(
         }
     };
 
-    match range {
-        Some(ByteRange { start, end }) => {
-            let length = end - start + 1;
+    let (status, content_length, content_range) = match range {
+        Some(ByteRange { start, end }) => (
+            StatusCode::PARTIAL_CONTENT,
+            end - start + 1,
+            Some(format!("bytes {start}-{end}/{total_size}")),
+        ),
 
-            let mut response = if head_only {
-                StatusCode::PARTIAL_CONTENT.into_response()
-            } else {
-                (StatusCode::PARTIAL_CONTENT, data[start..=end].to_vec()).into_response()
-            };
+        None => (StatusCode::OK, total_size, None),
+    };
 
-            let response_headers = response.headers_mut();
+    let mut response = if head_only {
+        status.into_response()
+    } else if let Some(body) = body {
+        (status, body).into_response()
+    } else {
+        status.into_response()
+    };
 
-            response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    let response_headers = response.headers_mut();
 
-            response_headers.insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_str(content_type)
-                    .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
-            );
+    response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
 
-            response_headers.insert(
-                header::CONTENT_DISPOSITION,
-                HeaderValue::from_static("inline"),
-            );
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(content_type)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
 
-            response_headers.insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static(CACHE_CONTROL),
-            );
+    response_headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("inline"),
+    );
 
-            response_headers.insert(
-                header::CONTENT_LENGTH,
-                HeaderValue::from_str(&length.to_string()).unwrap(),
-            );
+    response_headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(CACHE_CONTROL),
+    );
 
-            response_headers.insert(
-                header::CONTENT_RANGE,
-                HeaderValue::from_str(&format!("bytes {start}-{end}/{total_size}")).unwrap(),
-            );
+    response_headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&content_length.to_string()).unwrap(),
+    );
 
-            response
-        }
-
-        None => {
-            let mut response = if head_only {
-                StatusCode::OK.into_response()
-            } else {
-                data.into_response()
-            };
-
-            let response_headers = response.headers_mut();
-
-            response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-
-            response_headers.insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_str(content_type)
-                    .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
-            );
-
-            response_headers.insert(
-                header::CONTENT_DISPOSITION,
-                HeaderValue::from_static("inline"),
-            );
-
-            response_headers.insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static(CACHE_CONTROL),
-            );
-
-            response_headers.insert(
-                header::CONTENT_LENGTH,
-                HeaderValue::from_str(&total_size.to_string()).unwrap(),
-            );
-
-            response
-        }
+    if let Some(content_range) = content_range {
+        response_headers.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_str(&content_range).unwrap(),
+        );
     }
+
+    response
 }
 
 /// Fetch original file
@@ -668,14 +883,58 @@ async fn fetch_file(
     }
 
     let hash = file.as_hash(&db).await?;
-    let data = retrieve_file_by_hash(&hash).await?;
 
-    Ok(build_file_response(
-        &headers,
-        &hash.content_type,
-        data,
-        false,
-    ))
+    let total_size = hash.size.max(0) as usize
+        - if hash.iv.is_empty() {
+            0
+        } else {
+            AUTHENTICATION_TAG_SIZE_BYTES
+        };
+
+    let requested_range = match parse_range_header(&headers, total_size) {
+        Ok(range) => range,
+        Err(()) => {
+            return Ok(range_not_satisfiable(total_size));
+        }
+    };
+
+    if total_size <= MEDIA_RAM_CACHE_LIMIT {
+        let data = retrieve_file_by_hash(&hash).await?;
+
+        let body = match requested_range {
+            Some(ByteRange { start, end }) => data[start..=end].to_vec(),
+
+            None => data,
+        };
+
+        return Ok(build_metadata_response(
+            &headers,
+            &hash.content_type,
+            total_size,
+            false,
+            Some(body),
+        ));
+    }
+
+    let cache_path = cached_media_path(&hash).await?;
+
+    if let Some(range) = requested_range {
+        let body = read_cached_range(&cache_path, range).await?;
+
+        tokio::spawn(cleanup_media_disk_cache());
+
+        return Ok(build_metadata_response(
+            &headers,
+            &hash.content_type,
+            total_size,
+            false,
+            Some(body),
+        ));
+    }
+
+    tokio::spawn(cleanup_media_disk_cache());
+
+    build_streaming_file_response(&cache_path, &hash.content_type, total_size).await
 }
 
 async fn fetch_file_head(
@@ -707,13 +966,20 @@ async fn fetch_file_head(
     }
 
     let hash = file.as_hash(&db).await?;
-    let data = retrieve_file_by_hash(&hash).await?;
 
-    Ok(build_file_response(
+    let total_size = hash.size.max(0) as usize
+        - if hash.iv.is_empty() {
+            0
+        } else {
+            AUTHENTICATION_TAG_SIZE_BYTES
+        };
+
+    Ok(build_metadata_response(
         &headers,
         &hash.content_type,
-        data,
+        total_size,
         true,
+        None,
     ))
 }
 
@@ -779,4 +1045,147 @@ async fn fetch_file_mod(
         )
             .into_response()
     })
+}
+
+#[cfg(test)]
+mod media_streaming_tests {
+    use super::*;
+
+    fn range_headers(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_str(value).unwrap());
+        headers
+    }
+
+    #[test]
+    fn parses_bounded_range() {
+        let range = parse_range_header(&range_headers("bytes=100-199"), 1_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(range.start, 100);
+        assert_eq!(range.end, 199);
+    }
+
+    #[test]
+    fn parses_open_ended_range() {
+        let range = parse_range_header(&range_headers("bytes=900-"), 1_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(range.start, 900);
+        assert_eq!(range.end, 999);
+    }
+
+    #[test]
+    fn parses_suffix_range() {
+        let range = parse_range_header(&range_headers("bytes=-128"), 1_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(range.start, 872);
+        assert_eq!(range.end, 999);
+    }
+
+    #[test]
+    fn clamps_range_end_to_file_size() {
+        let range = parse_range_header(&range_headers("bytes=900-5000"), 1_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(range.start, 900);
+        assert_eq!(range.end, 999);
+    }
+
+    #[test]
+    fn rejects_invalid_and_multi_ranges() {
+        assert!(parse_range_header(&range_headers("bytes=1000-1001"), 1_000).is_err());
+        assert!(parse_range_header(&range_headers("bytes=200-100"), 1_000).is_err());
+        assert!(parse_range_header(&range_headers("bytes=0-1,4-5"), 1_000).is_err());
+        assert!(parse_range_header(&range_headers("items=0-1"), 1_000).is_err());
+    }
+
+    #[test]
+    fn partial_response_has_http_range_contract() {
+        let response = build_metadata_response(
+            &range_headers("bytes=1024-2047"),
+            "video/webm",
+            10_000,
+            false,
+            Some(vec![0; 1024]),
+        );
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[header::ACCEPT_RANGES], "bytes");
+        assert_eq!(
+            response.headers()[header::CONTENT_RANGE],
+            "bytes 1024-2047/10000"
+        );
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "1024");
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "video/webm");
+    }
+
+    #[test]
+    fn invalid_range_returns_416_contract() {
+        let response = build_metadata_response(
+            &range_headers("bytes=20000-21000"),
+            "video/webm",
+            10_000,
+            false,
+            None,
+        );
+
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(response.headers()[header::ACCEPT_RANGES], "bytes");
+        assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes */10000");
+    }
+
+    #[test]
+    fn head_response_needs_only_metadata() {
+        let response = build_metadata_response(
+            &HeaderMap::new(),
+            "video/mp4",
+            8_000_000_000usize,
+            true,
+            None,
+        );
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::ACCEPT_RANGES], "bytes");
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "8000000000");
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "video/mp4");
+    }
+
+    #[tokio::test]
+    async fn disk_range_reader_reads_only_requested_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("media.bin");
+        let payload: Vec<u8> = (0..=255).cycle().take(32 * 1024).collect();
+        std::fs::write(&path, &payload).unwrap();
+
+        let range = ByteRange {
+            start: 4_321,
+            end: 8_765,
+        };
+        let data = read_cached_range(&path, range).await.unwrap();
+
+        assert_eq!(data.len(), range.end - range.start + 1);
+        assert_eq!(data, payload[range.start..=range.end]);
+    }
+
+    #[tokio::test]
+    async fn full_disk_response_is_streaming_and_has_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("video.webm");
+        let payload = vec![0x5a; 2 * 1024 * 1024];
+        std::fs::write(&path, &payload).unwrap();
+
+        let response = build_streaming_file_response(&path, "video/webm", payload.len())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::ACCEPT_RANGES], "bytes");
+        assert_eq!(
+            response.headers()[header::CONTENT_LENGTH],
+            payload.len().to_string()
+        );
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "video/webm");
+    }
 }

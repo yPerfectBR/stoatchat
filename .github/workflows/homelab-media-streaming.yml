@@ -1,0 +1,26 @@
+name: Homelab Media Streaming
+
+on:
+  push:
+    branches: [homelab-media-streaming]
+    paths:
+      - "crates/services/autumn/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/homelab-media-streaming.yml"
+  pull_request:
+    paths:
+      - "crates/services/autumn/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+jobs:
+  autumn-media-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Media range unit tests
+        run: cargo test -p revolt-autumn media_streaming_tests -- --nocapture
