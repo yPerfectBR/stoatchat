@@ -5,7 +5,7 @@ use std::{
 
 use axum::{
     extract::{DefaultBodyLimit, Path, State},
-    http::{header, HeaderMap, Method},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
     Json, Router,
@@ -57,7 +57,10 @@ pub async fn router() -> Router<AppState> {
                 )),
         )
         .route("/:tag/:file_id", get(fetch_preview))
-        .route("/:tag/:file_id/:file_name", get(fetch_file))
+        .route(
+            "/:tag/:file_id/:file_name",
+            get(fetch_file).head(fetch_file_head),
+        )
         .route("/mod/:tag/:file_id/:file_name", get(fetch_file_mod))
         .layer(cors)
 }
@@ -444,6 +447,178 @@ async fn fetch_preview(
         .into_response())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ByteRange {
+    start: usize,
+    end: usize,
+}
+
+fn parse_range_header(
+    headers: &HeaderMap,
+    total_size: usize,
+) -> std::result::Result<Option<ByteRange>, ()> {
+    let Some(value) = headers.get(header::RANGE) else {
+        return Ok(None);
+    };
+
+    let value = value.to_str().map_err(|_| ())?;
+
+    let spec = value.strip_prefix("bytes=").ok_or(())?;
+
+    // Multipart ranges are intentionally not supported.
+    if spec.contains(',') {
+        return Err(());
+    }
+
+    let (start, end) = spec.split_once('-').ok_or(())?;
+
+    if total_size == 0 {
+        return Err(());
+    }
+
+    if start.is_empty() {
+        let suffix = end.parse::<usize>().map_err(|_| ())?;
+
+        if suffix == 0 {
+            return Err(());
+        }
+
+        let length = suffix.min(total_size);
+
+        return Ok(Some(ByteRange {
+            start: total_size - length,
+            end: total_size - 1,
+        }));
+    }
+
+    let start = start.parse::<usize>().map_err(|_| ())?;
+
+    if start >= total_size {
+        return Err(());
+    }
+
+    let end = if end.is_empty() {
+        total_size - 1
+    } else {
+        end.parse::<usize>().map_err(|_| ())?.min(total_size - 1)
+    };
+
+    if end < start {
+        return Err(());
+    }
+
+    Ok(Some(ByteRange { start, end }))
+}
+
+fn range_not_satisfiable(total_size: usize) -> Response {
+    let mut response = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+
+    response
+        .headers_mut()
+        .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+
+    if let Ok(value) = HeaderValue::from_str(&format!("bytes */{total_size}")) {
+        response.headers_mut().insert(header::CONTENT_RANGE, value);
+    }
+
+    response
+}
+
+fn build_file_response(
+    headers: &HeaderMap,
+    content_type: &str,
+    data: Vec<u8>,
+    head_only: bool,
+) -> Response {
+    let total_size = data.len();
+
+    let range = match parse_range_header(headers, total_size) {
+        Ok(range) => range,
+        Err(()) => {
+            return range_not_satisfiable(total_size);
+        }
+    };
+
+    match range {
+        Some(ByteRange { start, end }) => {
+            let length = end - start + 1;
+
+            let mut response = if head_only {
+                StatusCode::PARTIAL_CONTENT.into_response()
+            } else {
+                (StatusCode::PARTIAL_CONTENT, data[start..=end].to_vec()).into_response()
+            };
+
+            let response_headers = response.headers_mut();
+
+            response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+
+            response_headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_str(content_type)
+                    .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+            );
+
+            response_headers.insert(
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_static("inline"),
+            );
+
+            response_headers.insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static(CACHE_CONTROL),
+            );
+
+            response_headers.insert(
+                header::CONTENT_LENGTH,
+                HeaderValue::from_str(&length.to_string()).unwrap(),
+            );
+
+            response_headers.insert(
+                header::CONTENT_RANGE,
+                HeaderValue::from_str(&format!("bytes {start}-{end}/{total_size}")).unwrap(),
+            );
+
+            response
+        }
+
+        None => {
+            let mut response = if head_only {
+                StatusCode::OK.into_response()
+            } else {
+                data.into_response()
+            };
+
+            let response_headers = response.headers_mut();
+
+            response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+
+            response_headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_str(content_type)
+                    .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+            );
+
+            response_headers.insert(
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_static("inline"),
+            );
+
+            response_headers.insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static(CACHE_CONTROL),
+            );
+
+            response_headers.insert(
+                header::CONTENT_LENGTH,
+                HeaderValue::from_str(&total_size.to_string()).unwrap(),
+            );
+
+            response
+        }
+    }
+}
+
 /// Fetch original file
 ///
 /// Content disposition header will be set to 'attachment' to prevent browser from rendering anything.
@@ -463,6 +638,7 @@ async fn fetch_preview(
 )]
 async fn fetch_file(
     State(db): State<Database>,
+    headers: HeaderMap,
     Path((tag, file_id, file_name)): Path<(Tag, String, String)>,
 ) -> Result<Response> {
     let tag: &'static str = tag.clone().into();
@@ -492,17 +668,53 @@ async fn fetch_file(
     }
 
     let hash = file.as_hash(&db).await?;
-    retrieve_file_by_hash(&hash).await.map(|data| {
-        (
-            [
-                (header::CONTENT_TYPE, hash.content_type),
-                (header::CONTENT_DISPOSITION, "attachment".to_owned()),
-                (header::CACHE_CONTROL, CACHE_CONTROL.to_owned()),
-            ],
-            data,
-        )
-            .into_response()
-    })
+    let data = retrieve_file_by_hash(&hash).await?;
+
+    Ok(build_file_response(
+        &headers,
+        &hash.content_type,
+        data,
+        false,
+    ))
+}
+
+async fn fetch_file_head(
+    State(db): State<Database>,
+    headers: HeaderMap,
+    Path((tag, file_id, file_name)): Path<(Tag, String, String)>,
+) -> Result<Response> {
+    let tag: &'static str = tag.clone().into();
+    let file = db.fetch_attachment(tag, &file_id).await?;
+
+    if file.deleted.is_some_and(|v| v) {
+        return Err(create_error!(NotFound));
+    }
+
+    if file.used_for.is_none() {
+        return Err(create_error!(NotFound));
+    }
+
+    if file_name != file.filename {
+        if file_name == "original" {
+            let safe_filename = encode_component(&file.filename);
+
+            return Ok(
+                Redirect::permanent(&format!("/{tag}/{file_id}/{safe_filename}")).into_response(),
+            );
+        }
+
+        return Err(create_error!(NotFound));
+    }
+
+    let hash = file.as_hash(&db).await?;
+    let data = retrieve_file_by_hash(&hash).await?;
+
+    Ok(build_file_response(
+        &headers,
+        &hash.content_type,
+        data,
+        true,
+    ))
 }
 
 /// Fetch original file (Moderation)
