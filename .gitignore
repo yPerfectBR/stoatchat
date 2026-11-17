@@ -13,3 +13,5 @@ venv/
 
 livekit.yml
 .idea
+.vscode/launch.json
+.mise/config.local.toml

@@ -51,6 +51,25 @@ pub async fn edit(
         return Ok(Json(channel.into()));
     }
 
+    let remove: Vec<FieldsChannel> = data
+        .remove
+        .iter()
+        .cloned()
+        .map(Into::into)
+        .collect();
+
+    if remove.contains(&FieldsChannel::DefaultPermissions) {
+        let mut proposed = channel.clone();
+        proposed.remove_fields(remove.clone());
+        let mut query = DatabasePermissionQuery::new(db, &user).channel(&proposed);
+        if !calculate_channel_permissions(&mut query)
+            .await
+            .has_channel_permission(ChannelPermission::ViewChannel)
+        {
+            return Err(create_error!(CannotRemoveOwnChannelView));
+        }
+    }
+
     let mut partial: PartialChannel = Default::default();
 
     // Transfer group ownership
@@ -67,6 +86,12 @@ pub async fn edit(
             // Ensure user is part of group
             if !recipients.contains(&new_owner) {
                 return Err(create_error!(NotInGroup));
+            }
+
+            // Ensure new owner is not a bot
+            let new_owner_user = db.fetch_user(&new_owner).await?;
+            if new_owner_user.bot.is_some() {
+                return Err(create_error!(IsBot))
             }
 
             // Transfer ownership
@@ -267,12 +292,6 @@ pub async fn edit(
         _ => return Err(create_error!(InvalidOperation)),
     };
 
-    let remove = data
-        .remove
-        .into_iter()
-        .map(|f| f.into())
-        .collect::<Vec<FieldsChannel>>();
-
     let before = if before_channel.server().is_some() {
         Some(before_channel.generate_diff(&partial, &remove))
     } else {
@@ -296,4 +315,106 @@ pub async fn edit(
     };
 
     Ok(Json(channel.into()))
+}
+
+#[cfg(test)]
+mod test {
+    use std::collections::HashSet;
+    use crate::{rocket, util::test::TestHarness};
+    use revolt_database::{Channel};
+    use revolt_models::v0::{DataCreateGroup, SystemMessage};
+    use rocket::http::{ContentType, Header, Status};
+    use revolt_database::events::client::EventV1;
+    use crate::util::test::PubSubTestHelper;
+
+    #[rocket::async_test]
+    async fn success_transfer_group_owner() {
+        let harness = TestHarness::new().await;
+        let (_, session, mut user) = harness.new_user().await;
+        let (_, _, mut other_user) = harness.new_user().await;
+
+        // Create a group chat
+        let group = Channel::create_group(
+            &harness.db,
+            DataCreateGroup {
+                users: HashSet::from([other_user.id.clone()]),
+                ..Default::default()
+            },
+            user.id.clone(),
+        )
+            .await
+            .expect("`Channel`");
+
+        let mut pubsub = PubSubTestHelper::new(group.id()).await;
+
+        // Make other user the owner
+        let owner_response = harness
+            .client
+            .patch(format!("/channels/{}", group.id()))
+            .header(ContentType::JSON)
+            .header(Header::new("X-Session-Token", session.token.clone()))
+            .body(
+                json!({
+                    "owner": other_user.id,
+                })
+                    .to_string(),
+            )
+            .dispatch()
+            .await;
+
+        assert_eq!(owner_response.status(), Status::Ok);
+        drop(owner_response);
+
+        pubsub
+            .wait_for_event(|event| match event {
+                EventV1::Message(message) => match &message.system {
+                    Some(SystemMessage::ChannelOwnershipChanged { from, to }) => {
+                        assert_eq!(from, &user.id);
+                        assert_eq!(to, &other_user.id);
+
+                        true
+                    }
+                    _ => false,
+                },
+                _ => false,
+            })
+            .await;
+    }
+
+    #[rocket::async_test]
+    async fn fail_transfer_owner_to_bot() {
+        let harness = TestHarness::new().await;
+        let (_, session, mut user) = harness.new_user().await;
+        let (_, mut bot_user) = harness.new_bot(&user).await;
+
+        // Create a group chat
+        let group = Channel::create_group(
+            &harness.db,
+            DataCreateGroup {
+                users: HashSet::from([bot_user.id.clone()]),
+                ..Default::default()
+            },
+            user.id.clone(),
+        )
+            .await
+            .expect("`Channel`");
+
+        // Make bot the owner
+        let owner_response = harness
+            .client
+            .patch(format!("/channels/{}", group.id()))
+            .header(ContentType::JSON)
+            .header(Header::new("X-Session-Token", session.token.clone()))
+            .body(
+                json!({
+                    "owner": bot_user.id,
+                })
+                    .to_string(),
+            )
+            .dispatch()
+            .await;
+
+        assert_eq!(owner_response.status(), Status::BadRequest);
+        drop(owner_response);
+    }
 }

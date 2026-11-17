@@ -6,6 +6,7 @@ use once_cell::sync::Lazy;
 use revolt_config::capture_message;
 use revolt_models::v0::PushNotification;
 use std::{
+    any::Any,
     collections::{HashMap, HashSet},
     time::Duration,
 };
@@ -48,6 +49,12 @@ struct Task {
 }
 
 static Q: Lazy<Queue<Data>> = Lazy::new(|| Queue::new(10_000));
+
+/// Send pushes once the channel has been quiet for this long
+const PROCESS_MESSAGE_SAVE_AFTER: Duration = Duration::from_secs(1);
+
+/// but never hold them back longer than this
+const PROCESS_MESSAGE_EXPIRE_AFTER: Duration = Duration::from_secs(3);
 
 /// Queue a new task for a worker
 pub async fn queue_ack(channel: String, user: String, event: AckEvent) {
@@ -101,7 +108,7 @@ pub async fn handle_ack_event(
                 let before_mentions = before.mentions.unwrap_or_default().len();
                 let after_mentions = after.mentions.unwrap_or_default().len();
 
-                let mentions_acked = before_mentions - after_mentions;
+                let mentions_acked = before_mentions.saturating_sub(after_mentions);
 
                 if mentions_acked > 0 {
                     if let Err(err) = amqp
@@ -145,8 +152,12 @@ pub async fn handle_ack_event(
                     .collect();
 
                 if !message_ids.is_empty() {
-                    db.add_mention_to_unread(channel, user, &message_ids)
-                        .await?;
+                    // one user failing shouldn't stop everyone else's notifications
+                    if let Err(err) = db.add_mention_to_unread(channel, user, &message_ids).await {
+                        revolt_config::capture_error(&err);
+                        error!("Failed to add mentions for user {user} in {channel}: {err:?}");
+                        continue;
+                    }
                 }
                 info!("Added {} mentions for user {}", message_ids.len(), &user);
             }
@@ -190,17 +201,18 @@ pub async fn handle_ack_event(
                     &mass_mentions[0].message.channel
                 );
 
-                let channel = db
-                    .fetch_channel(&mass_mentions[0].message.channel)
-                    .await
-                    .expect("Failed to fetch channel from db");
+                // channel might've been deleted in the meantime
+                let channel = db.fetch_channel(&mass_mentions[0].message.channel).await?;
 
                 if let TextChannel { server, .. } = channel {
                     if let Err(err) = amqp.mass_mention_message_sent(server, mass_mentions).await {
                         revolt_config::capture_error(&err);
                     }
                 } else {
-                    panic!("Unknown channel type when sending mass mention event");
+                    info!(
+                        "Unknown channel type {:?} when sending mass mention event",
+                        channel.type_id()
+                    );
                 }
             }
         }
@@ -300,11 +312,20 @@ pub async fn worker(db: Database, amqp: AMQP) {
                     }
                 }
             } else {
-                tasks.insert(key, DelayedTask::new(Task { event }));
+                let task = match &event {
+                    AckEvent::ProcessMessage { .. } => DelayedTask::with_timings(
+                        Task { event },
+                        PROCESS_MESSAGE_SAVE_AFTER,
+                        PROCESS_MESSAGE_EXPIRE_AFTER,
+                    ),
+                    AckEvent::AckMessage { .. } => DelayedTask::new(Task { event }),
+                };
+
+                tasks.insert(key, task);
             }
         }
 
         // Sleep for an arbitrary amount of time.
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }

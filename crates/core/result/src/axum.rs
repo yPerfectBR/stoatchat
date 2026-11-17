@@ -12,6 +12,8 @@ impl IntoResponse for Error {
         let status = match self.error_type {
             ErrorType::LabelMe => StatusCode::INTERNAL_SERVER_ERROR,
 
+            ErrorType::ContactSupport { .. } => StatusCode::BAD_REQUEST,
+
             ErrorType::AlreadyOnboarded => StatusCode::FORBIDDEN,
 
             ErrorType::UnknownUser => StatusCode::NOT_FOUND,
@@ -70,6 +72,7 @@ impl IntoResponse for Error {
             ErrorType::CannotGiveMissingPermissions => StatusCode::FORBIDDEN,
             ErrorType::NotOwner => StatusCode::FORBIDDEN,
             ErrorType::IsElevated => StatusCode::FORBIDDEN,
+            ErrorType::CannotRemoveOwnChannelView => StatusCode::FORBIDDEN,
 
             ErrorType::DatabaseError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorType::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
@@ -97,6 +100,7 @@ impl IntoResponse for Error {
             ErrorType::FileTooLarge { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             ErrorType::FileTypeNotAllowed => StatusCode::BAD_REQUEST,
             ErrorType::ImageProcessingFailed => StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorType::ImageResolutionNotAllowed => StatusCode::UNPROCESSABLE_ENTITY,
             ErrorType::NoEmbedData => StatusCode::BAD_REQUEST,
             ErrorType::RenderFail => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorType::MissingHeaders => StatusCode::BAD_REQUEST,
@@ -123,6 +127,8 @@ impl IntoResponse for Error {
             ErrorType::IncorrectData { .. } => StatusCode::BAD_REQUEST,
         };
 
-        (status, Json(&self)).into_response()
+        let mut response = (status, Json(&self)).into_response();
+        response.extensions_mut().insert(self);
+        response
     }
 }
